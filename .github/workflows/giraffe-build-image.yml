@@ -50,10 +50,17 @@ jobs:
           grep -q "GIRAFFE_PATCH_VERSION=$GIRAFFE_PATCH_VERSION" GIRAFFE-PATCH.md
           echo "PROVENANCE=PASS head=$(git rev-parse HEAD)"
 
-      - name: Segredos (gitleaks)
-        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Só os commits que ESTE fork acrescenta sobre o upstream. O histórico upstream carrega
+      # exemplos de documentação (`curl -H apikey` em docs/wiki) e um stack YAML de exemplo com chave
+      # fictícia — achados PRE_EXISTING que não entram nesta imagem por decisão nossa e cujo
+      # tratamento é do upstream. Binário fixado por versão e digest da imagem oficial do gitleaks.
+      - name: Segredos (gitleaks — apenas commits do patch, upstream..HEAD)
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/repo" -w /repo \
+            zricethezav/gitleaks:v8.24.3 \
+            detect --source /repo --log-opts="${UPSTREAM_COMMIT}..HEAD" --redact --no-banner --exit-code 1
+          echo "GITLEAKS_PATCH_RANGE=PASS"
 
       - name: Go
         uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
