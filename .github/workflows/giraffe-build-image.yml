@@ -1,0 +1,156 @@
+# GIRAFFE PATCH — build controlado da imagem corrigida (ver GIRAFFE-PATCH.md).
+#
+# Manual apenas (workflow_dispatch). Publica UMA tag versionada e imutável no GHCR e imprime o
+# digest; nunca publica `latest`. Roda os mesmos gates que o build local (gofmt, vet, test, build),
+# um scan de segredos e um scan de vulnerabilidades da imagem, antes do push.
+name: Giraffe — build image (patched 0.7.2)
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Tag versionada da imagem (nunca latest)'
+        required: true
+        default: '0.7.2-giraffe.1'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: gates + build + scan + push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/martinsjunior001/evolution-go
+      UPSTREAM_VERSION: '0.7.2'
+      UPSTREAM_COMMIT: 9337afc47e10b86cc896a6f432240e40fee95dd1
+      GIRAFFE_PATCH_VERSION: '1'
+    steps:
+      - name: Tag não pode ser latest
+        run: |
+          set -euo pipefail
+          case "${{ inputs.image_tag }}" in
+            latest|main|develop|'') echo "::error::tag proibida"; exit 1 ;;
+          esac
+          echo "IMAGE_TAG=${{ inputs.image_tag }}" >> "$GITHUB_ENV"
+
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Proveniência — a branch descende do commit upstream base
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "$UPSTREAM_COMMIT" HEAD || { echo "::error::HEAD não descende de $UPSTREAM_COMMIT"; exit 1; }
+          grep -q "UPSTREAM_COMMIT=$UPSTREAM_COMMIT" GIRAFFE-PATCH.md
+          grep -q "GIRAFFE_PATCH_VERSION=$GIRAFFE_PATCH_VERSION" GIRAFFE-PATCH.md
+          echo "PROVENANCE=PASS head=$(git rev-parse HEAD)"
+
+      - name: Segredos (gitleaks)
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: gofmt (arquivos do patch), vet, test, build
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq build-essential libjpeg-turbo8-dev libwebp-dev >/dev/null
+          test -z "$(gofmt -l pkg/whatsmeow/service/whatsmeow.go pkg/whatsmeow/service/giraffe_auth_store.go pkg/whatsmeow/service/giraffe_auth_store_test.go)"
+          go vet ./...
+          go test ./...
+          go test ./pkg/whatsmeow/service/ -run Giraffe -v
+          CGO_ENABLED=1 go build -ldflags "-X main.version=${IMAGE_TAG}" -o /tmp/server ./cmd/evolution-go
+          echo "GATES=PASS"
+
+      - name: Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Build local (sem push) para o scan
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ env.IMAGE }}:${{ inputs.image_tag }}
+          build-args: |
+            VERSION=${{ inputs.image_tag }}
+          labels: |
+            org.opencontainers.image.title=evolution-go (Giraffe patched)
+            org.opencontainers.image.version=${{ inputs.image_tag }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.created=${{ github.event.repository.updated_at }}
+            org.opencontainers.image.base.name=evoapicloud/evolution-go:0.7.2
+            dev.giraffe.upstream.repo=https://github.com/evolution-foundation/evolution-go
+            dev.giraffe.upstream.version=${{ env.UPSTREAM_VERSION }}
+            dev.giraffe.upstream.commit=${{ env.UPSTREAM_COMMIT }}
+            dev.giraffe.patch.source=upstream PR #174
+            dev.giraffe.patch.purpose=PostgreSQL sqlstore pool leak
+            dev.giraffe.patch.version=${{ env.GIRAFFE_PATCH_VERSION }}
+
+      - name: Vulnerabilidades da imagem (Trivy — HIGH/CRITICAL falham)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ inputs.image_tag }}
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+
+      - name: Inspeção da imagem (arquitetura, labels, versão)
+        run: |
+          set -euo pipefail
+          docker image inspect "$IMAGE:$IMAGE_TAG" --format 'ARCH={{.Os}}/{{.Architecture}} SIZE={{.Size}}'
+          docker image inspect "$IMAGE:$IMAGE_TAG" --format '{{range $k,$v := .Config.Labels}}{{$k}}={{$v}}{{"\n"}}{{end}}' | grep -E '^(org.opencontainers.image.(version|revision|source)|dev.giraffe)'
+          docker run --rm --entrypoint sh "$IMAGE:$IMAGE_TAG" -c 'cat /app/VERSION; ls -la /app/server /app/LICENSE* 2>/dev/null || true'
+
+      - name: Login no GHCR
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push (tag versionada, nunca latest)
+        id: push
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE }}:${{ inputs.image_tag }}
+          build-args: |
+            VERSION=${{ inputs.image_tag }}
+          labels: |
+            org.opencontainers.image.title=evolution-go (Giraffe patched)
+            org.opencontainers.image.version=${{ inputs.image_tag }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.base.name=evoapicloud/evolution-go:0.7.2
+            dev.giraffe.upstream.repo=https://github.com/evolution-foundation/evolution-go
+            dev.giraffe.upstream.version=${{ env.UPSTREAM_VERSION }}
+            dev.giraffe.upstream.commit=${{ env.UPSTREAM_COMMIT }}
+            dev.giraffe.patch.source=upstream PR #174
+            dev.giraffe.patch.purpose=PostgreSQL sqlstore pool leak
+            dev.giraffe.patch.version=${{ env.GIRAFFE_PATCH_VERSION }}
+
+      - name: Resultado
+        run: |
+          set -euo pipefail
+          echo "IMAGE_TAG=$IMAGE:$IMAGE_TAG"
+          echo "IMAGE_DIGEST=${{ steps.push.outputs.digest }}"
+          echo "IMAGE_ID=${{ steps.push.outputs.imageid }}"
+          echo "OCI_VERSION=$IMAGE_TAG"
+          echo "OCI_REVISION=${{ github.sha }}"
+          echo "BUILD_SHA=${{ github.sha }}"
+          echo "UPSTREAM_BASE=$UPSTREAM_COMMIT"

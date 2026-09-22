@@ -316,17 +316,31 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 
 	var container *sqlstore.Container
 
+	// GIRAFFE PATCH (GIRAFFE_PATCH_VERSION=1, upstream PR #174 — see GIRAFFE-PATCH.md).
+	// StartClient runs on every connect AND every reconnect. Calling sqlstore.New here opened a
+	// brand-new, uncapped *sql.DB per call that was never closed — one leaked pool per cycle until
+	// PostgreSQL answered "too many clients already". The bounded authDB pool already exists (see
+	// initPostgresAuthDB in cmd/evolution-go/main.go) and is reused below. Fail-closed on purpose:
+	// a missing authDB must NOT fall back to sqlstore.New, or the leak would silently return.
+	modo, modoErr := giraffeAuthStoreMode(w.config.PostgresAuthDB, w.authDB != nil)
+	if modoErr != nil {
+		w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] %v", cd.Instance.Id, modoErr)
+		return
+	}
+
 	if w.config.WaDebug != "" {
 		dbLog := waLog.Stdout("Database", w.config.WaDebug, true)
-		if w.config.PostgresAuthDB != "" {
-			container, err = sqlstore.New(context.Background(), "postgres", w.config.PostgresAuthDB, dbLog)
+		if modo == giraffeAuthStorePostgresShared {
+			container = sqlstore.NewWithDB(w.authDB, "postgres", dbLog)
+			err = container.Upgrade(context.Background())
 		} else {
 			dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
 			container, err = sqlstore.New(context.Background(), "sqlite", dsn, dbLog)
 		}
 	} else {
-		if w.config.PostgresAuthDB != "" {
-			container, err = sqlstore.New(context.Background(), "postgres", w.config.PostgresAuthDB, nil)
+		if modo == giraffeAuthStorePostgresShared {
+			container = sqlstore.NewWithDB(w.authDB, "postgres", nil)
+			err = container.Upgrade(context.Background())
 		} else {
 			dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
 			container, err = sqlstore.New(context.Background(), "sqlite", dsn, nil)
